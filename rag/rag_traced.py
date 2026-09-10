@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import tiktoken
 import os
 import sys
@@ -9,15 +11,18 @@ import chromadb
 import rag.embeddings_utils as embeddings_utils
 from rag.сhunk import Chunk
 
+INDEXER_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = INDEXER_DIR.parent
 
-def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
+
+def _count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     """Return number of tokens for given text and model."""
     enc = tiktoken.encoding_for_model(model)
     tokens = enc.encode(text)
     return len(tokens)
 
 
-def retrieve_chunks(openai_client: OpenAI, langfuse: Langfuse, collection: chromadb.Collection, query: str,
+def _retrieve_chunks(langfuse: Langfuse, collection: chromadb.Collection, query: str,
                     model: str = "text-embedding-3-small"):
     print(f"Retrieving chunks for query: {query}")
     with langfuse.start_as_current_observation(
@@ -55,11 +60,29 @@ def retrieve_chunks(openai_client: OpenAI, langfuse: Langfuse, collection: chrom
             metadata={"retrieval_latency_ms": elapsed_ms},
         )
     print(f"Retrieved {len(chunks)} chunks for query: {query} in {elapsed_ms} ms")
-    print(f"Retrieved chunks: {chunks}")
+    print(f"Retrieved documents: {[chunk.doc_id for chunk in chunks]}")
 
     return chunks, elapsed_ms
 
-def prompt_assembly(langfuse: Langfuse, query:str, retrieved_results: list[Chunk]):
+
+def load_system_prompt(langfuse: Langfuse):
+    try:
+        prompt = langfuse.get_prompt(
+            "system",
+            label="production",
+            cache_ttl_seconds=300  # cache for 5 minutes
+        ).compile()
+        print(f"Loaded system prompt from Langfuse: {prompt}")
+        return prompt
+    except Exception as e:
+        print(f"Langfuse unavailable, using fallback prompt: {e}")
+        with open(PROJECT_ROOT / "prompts" / "system.md", "r", encoding="utf-8") as f:
+            default_system_prompt = f.read()
+
+        return default_system_prompt
+
+
+def _prompt_assembly(langfuse: Langfuse, query:str, retrieved_results: list[Chunk]):
     print(f"Assembling prompt for query: {query} with {len(retrieved_results)} retrieved chunks")
     context_blocks = []
     context_tokens = 0
@@ -79,27 +102,21 @@ def prompt_assembly(langfuse: Langfuse, query:str, retrieved_results: list[Chunk
                              f"Статья: {retrieved_results[idx].article}\n"
                              f"Индекс фрагмента: {retrieved_results[idx].chunk_id}\n"
                              f"Текст: {retrieved_results[idx].text}")
-            block_tokens_count = count_tokens(context_block)
+            block_tokens_count = _count_tokens(context_block)
             if context_tokens + block_tokens_count <= int(os.getenv("MAX_CONTEXT_TOKENS")):
                 context_tokens += block_tokens_count
                 context_blocks.append(context_block)
             else:
                 break
+        print(f"Context assembled with {len(context_blocks)} blocks and {context_tokens} tokens")
 
         context_text = "\n\n".join(context_blocks)
 
-        system_prompt = (
-            "Ты ассистент по нормативно-правовым актам Республики Казахстан. Вопросы могут быть заданы на одном из "
-            "языков: ru, kz, или en. Отвечай на том же языке, на котором задан вопрос. Если язык вопроса не определен "
-            "или не входит в список, отвечай на русском языке. Если ответ не может быть найден в предоставленном "
-            "контексте, честно признай это, не изобретай ответ. В ответе должен быть список: названий документов "
-            " и статей, на которые ссылается ответ. "
-        )
+        system_prompt = load_system_prompt(langfuse)
 
         user_prompt = (
             f"Контекст:\n{context_text}\n\n"
             f"Вопрос пользователя: {query}\n\n"
-            "Дай краткий и точный ответ, ссылаясь на полученный контекст."
         )
 
         messages =  [
@@ -118,7 +135,7 @@ def prompt_assembly(langfuse: Langfuse, query:str, retrieved_results: list[Chunk
         return messages
 
 
-def generate_answer(openai_client: OpenAI, langfuse: Langfuse, prompt: list):
+def _generate_answer(openai_client: OpenAI, langfuse: Langfuse, prompt: list):
     print(f"Generating answer for prompt with {len(prompt)} messages")
     with langfuse.start_as_current_observation(
         as_type="generation",
@@ -149,31 +166,42 @@ def answer(question: str):
     load_dotenv()
     openai_client = OpenAI()
     langfuse = get_client()
-    chroma_client = chromadb.PersistentClient(path="./chroma_data")
+    chroma_client = chromadb.PersistentClient(path=PROJECT_ROOT / "./chroma_data")
     collection = chroma_client.get_or_create_collection(
         name="structured_chunks" # another option is "overlapping_chunks"
     )
+    strategy = "structured" # another option is "overlapping"
 
     with langfuse.start_as_current_observation(
         as_type="span",
         name="rag-assistant",
         input={"query": question},
     ) as root_span:
-        with propagate_attributes(metadata={"chunker": "structured", "embeddings": "intfloat/multilingual-e5-large"}):
-            retrieved_chunks, retrieval_latency_ms = retrieve_chunks(openai_client, langfuse, collection, question)
-            prompt = prompt_assembly(langfuse, question, retrieved_chunks)
-            full_response_text = generate_answer(openai_client, langfuse, prompt)
+        with propagate_attributes(metadata={"chunking_strategy": strategy,
+                                            "embedding_model": "intfloat/multilingual-e5-large",
+                                            "llm_model": "gpt-4o-mini",
+                                            "max_context_tokens": int(os.getenv("MAX_CONTEXT_TOKENS")),
+                                            "top_k": 3,
+                                            "system_prompt_version": "1.0",
+                                            "judge_prompt_version": "1.0"
+                                            }):
+            retrieved_chunks, retrieval_latency_ms = _retrieve_chunks(langfuse, collection, question)
+            prompt = _prompt_assembly(langfuse, question, retrieved_chunks)
+            full_response_text = _generate_answer(openai_client, langfuse, prompt)
+            if full_response_text:
+                result_json= json.loads(full_response_text)
 
             root_span.update(
                 output={
-                    "answer": full_response_text,
+                    "answer": result_json.get("answer"),
+                    "language": result_json.get("language"),
                     "source_list": [retrieved_chunks[idx].doc_id for idx in range(len(retrieved_chunks))],
                     "retrieval_latency_ms": retrieval_latency_ms,
                 }
             )
 
     langfuse.flush()
-    return full_response_text
+    return result_json
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
